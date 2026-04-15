@@ -1,6 +1,5 @@
 const express = require("express");
 const cors = require("cors");
-const Stockfish = require("stockfish");
 
 const app = express();
 app.use(cors());
