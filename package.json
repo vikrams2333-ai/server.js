@@ -1,12 +1,14 @@
 {
   "name": "chess-bot-server",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "multiplayer-server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node multiplayer-server.js"
   },
   "dependencies": {
+    "chess.js": "^1.4.0",
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "socket.io": "^4.8.1"
   }
 }
