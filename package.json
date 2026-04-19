@@ -1,14 +1,20 @@
 {
-  "name": "chess-bot-server",
+  "name": "chess-app-socket",
   "version": "1.0.0",
-  "main": "multiplayer-server.js",
+  "private": true,
+  "description": "Socket.IO multiplayer server for ChessApp",
+  "main": "index.js",
   "scripts": {
-    "start": "node multiplayer-server.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "chess.js": "^1.4.0",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "socket.io": "^4.8.1"
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
