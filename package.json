@@ -2,7 +2,7 @@
   "name": "chess-app-socket",
   "version": "1.0.0",
   "private": true,
-  "description": "Socket.IO multiplayer server for ChessApp",
+  "description": "Socket.IO match server for ChessApp",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
