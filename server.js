@@ -1,57 +1,152 @@
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
-const cors = require("cors");
-const { Server } = require("socket.io");
 const { Chess } = require("chess.js");
+const { Server } = require("socket.io");
+const cors = require("cors");
 const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || "*";
+const adminApiKey = (process.env.ADMIN_API_KEY || "").trim();
 app.set("trust proxy", 1);
+app.use(express.json({ limit: "200kb" }));
 app.use(
   cors({
     origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((s) => s.trim()),
   })
 );
 app.get("/", (_req, res) => {
-  res.type("text").send("Multiplayer server OK");
+  res.type("text").send("Chess socket server OK");
 });
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, service: "chess-socket" });
 });
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((s) => s.trim()),
-  },
+  cors: { origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((s) => s.trim()) },
   connectTimeout: 45_000,
   pingTimeout: 25_000,
   pingInterval: 10_000,
 });
-const DISCONNECT_FORFEIT_MS = 30_000;
-const BACKGROUND_FORFEIT_MS = 60_000;
 /** @type {Map<string, { socket: import("socket.io").Socket, uid: string }>} */
 const firestoreMatchWaiters = new Map();
-/** @type {Map<string, Array<{ socket: import("socket.io").Socket, uid: string, mode: "free" | "paid", betAmount: number }>>} */
+/** @type {Map<string, Array<{ socket: import("socket.io").Socket, uid: string, mode: string, betAmount: number }>>} */
 const waitingQueues = new Map();
-/** @type {Map<string, any>} */
-const roomStates = new Map();
-/** In-memory wallet ledger (replace with DB for production) */
-const DEFAULT_SERVER_BALANCE = 1000;
-/** @type {Map<string, number>} */
-const serverBalancesByUid = new Map();
-/** @type {Set<string>} */
-const serverWalletSettledGameIds = new Set();
 function perPlayerMsForMode(mode) {
   return mode === "paid" ? 5 * 60 * 1000 : 10 * 60 * 1000;
 }
-function queueKey(mode, betAmount) {
-  return mode === "paid" ? `paid_${Number(betAmount) || 0}` : "free";
+/** @type {Map<string, any>} */
+const roomStates = new Map();
+const DEFAULT_SERVER_BALANCE = 1000;
+/** @type {Map<string, number>} */
+const serverBalancesByUid = new Map();
+/** @type {Map<string, Array<any>>} */
+const serverWalletLedgerByUid = new Map();
+/** Paid games that already updated the server ledger (idempotent). */
+const serverWalletSettledGameIds = new Set();
+function normalizeUid(uid) {
+  if (uid == null) return "";
+  return String(uid).trim();
 }
-function getSrvBal(uid) {
+function getOrCreateLedger(uid) {
+  if (!serverWalletLedgerByUid.has(uid)) {
+    serverWalletLedgerByUid.set(uid, []);
+  }
+  return serverWalletLedgerByUid.get(uid);
+}
+function pushWalletLedger(uid, entry) {
+  const rows = getOrCreateLedger(uid);
+  rows.push({
+    id: crypto.randomUUID(),
+    uid,
+    at: Date.now(),
+    ...entry,
+  });
+  if (rows.length > 250) {
+    rows.splice(0, rows.length - 250);
+  }
+}
+function getSrvBal(uidRaw) {
+  const uid = normalizeUid(uidRaw);
+  if (!uid) return DEFAULT_SERVER_BALANCE;
   if (!serverBalancesByUid.has(uid)) {
     serverBalancesByUid.set(uid, DEFAULT_SERVER_BALANCE);
   }
   return serverBalancesByUid.get(uid);
+}
+function setSrvBal(uidRaw, nextBalance, meta = {}) {
+  const uid = normalizeUid(uidRaw);
+  if (!uid) return null;
+  const prev = getSrvBal(uid);
+  const next = Math.max(0, Math.floor(Number(nextBalance) || 0));
+  serverBalancesByUid.set(uid, next);
+  pushWalletLedger(uid, {
+    type: "set",
+    source: meta.source || "system",
+    reason: meta.reason || "manual_set",
+    prevBalance: prev,
+    nextBalance: next,
+    delta: next - prev,
+    gameId: meta.gameId || null,
+    by: meta.by || null,
+    note: meta.note || null,
+    ref: meta.ref || null,
+  });
+  return next;
+}
+function applySrvDelta(uidRaw, deltaRaw, meta = {}) {
+  const uid = normalizeUid(uidRaw);
+  if (!uid) return null;
+  const delta = Math.floor(Number(deltaRaw) || 0);
+  const prev = getSrvBal(uid);
+  const next = Math.max(0, prev + delta);
+  serverBalancesByUid.set(uid, next);
+  pushWalletLedger(uid, {
+    type: delta >= 0 ? "credit" : "debit",
+    source: meta.source || "system",
+    reason: meta.reason || "adjustment",
+    prevBalance: prev,
+    nextBalance: next,
+    delta,
+    gameId: meta.gameId || null,
+    by: meta.by || null,
+    note: meta.note || null,
+    ref: meta.ref || null,
+  });
+  return next;
+}
+function parseMoneyAmount(value) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n <= 0) {
+    return null;
+  }
+  return n;
+}
+function isAdminRequestAuthorized(req) {
+  if (!adminApiKey) {
+    return false;
+  }
+  const header = req.get("x-admin-key");
+  if (header && String(header).trim() === adminApiKey) {
+    return true;
+  }
+  const auth = req.get("authorization");
+  if (!auth) return false;
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  return token === adminApiKey;
+}
+function requireAdmin(req, res, next) {
+  if (!adminApiKey) {
+    res.status(503).json({
+      ok: false,
+      error: "ADMIN_API_KEY is not configured on the server.",
+    });
+    return;
+  }
+  if (!isAdminRequestAuthorized(req)) {
+    res.status(401).json({ ok: false, error: "Unauthorized admin request." });
+    return;
+  }
+  next();
 }
 function calculateWinnerCreditServer(betPerPlayer) {
   const total = betPerPlayer * 2;
@@ -59,6 +154,77 @@ function calculateWinnerCreditServer(betPerPlayer) {
   const winnerAmount = total - commission;
   return { total, commission, winnerAmount };
 }
+app.get("/admin/wallet/:uid", requireAdmin, (req, res) => {
+  const uid = normalizeUid(req.params.uid);
+  if (!uid) {
+    res.status(400).json({ ok: false, error: "uid is required." });
+    return;
+  }
+  res.json({
+    ok: true,
+    uid,
+    balance: getSrvBal(uid),
+    ledgerCount: getOrCreateLedger(uid).length,
+  });
+});
+app.get("/admin/wallet/:uid/transactions", requireAdmin, (req, res) => {
+  const uid = normalizeUid(req.params.uid);
+  if (!uid) {
+    res.status(400).json({ ok: false, error: "uid is required." });
+    return;
+  }
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+  const rows = [...getOrCreateLedger(uid)].slice(-limit).reverse();
+  res.json({ ok: true, uid, transactions: rows });
+});
+app.post("/admin/wallet/credit", requireAdmin, (req, res) => {
+  const uid = normalizeUid(req.body?.uid);
+  const amount = parseMoneyAmount(req.body?.amount);
+  if (!uid || amount == null) {
+    res.status(400).json({ ok: false, error: "uid and positive amount are required." });
+    return;
+  }
+  const next = applySrvDelta(uid, amount, {
+    source: "admin_panel",
+    reason: "admin_credit",
+    by: req.body?.by || "admin",
+    note: req.body?.note || null,
+    ref: req.body?.ref || req.body?.upiRef || null,
+  });
+  res.json({ ok: true, uid, balance: next });
+});
+app.post("/admin/wallet/debit", requireAdmin, (req, res) => {
+  const uid = normalizeUid(req.body?.uid);
+  const amount = parseMoneyAmount(req.body?.amount);
+  if (!uid || amount == null) {
+    res.status(400).json({ ok: false, error: "uid and positive amount are required." });
+    return;
+  }
+  const next = applySrvDelta(uid, -amount, {
+    source: "admin_panel",
+    reason: "admin_debit",
+    by: req.body?.by || "admin",
+    note: req.body?.note || null,
+    ref: req.body?.ref || null,
+  });
+  res.json({ ok: true, uid, balance: next });
+});
+app.post("/admin/wallet/set", requireAdmin, (req, res) => {
+  const uid = normalizeUid(req.body?.uid);
+  const nextRaw = Math.floor(Number(req.body?.balance));
+  if (!uid || !Number.isFinite(nextRaw) || nextRaw < 0) {
+    res.status(400).json({ ok: false, error: "uid and non-negative balance are required." });
+    return;
+  }
+  const next = setSrvBal(uid, nextRaw, {
+    source: "admin_panel",
+    reason: "admin_set_balance",
+    by: req.body?.by || "admin",
+    note: req.body?.note || null,
+    ref: req.body?.ref || null,
+  });
+  res.json({ ok: true, uid, balance: next });
+});
 function buildBalancesForGameResult(st, payload) {
   const snapshot = () => ({
     [st.whiteUid]: getSrvBal(st.whiteUid),
@@ -67,17 +233,40 @@ function buildBalancesForGameResult(st, payload) {
   if (st.mode !== "paid" || !(st.betAmount > 0)) {
     return { balancesByUid: snapshot(), paid: false };
   }
-  if (serverWalletSettledGameIds.has(st.gameId)) {
+  const gid = st.gameId;
+  if (serverWalletSettledGameIds.has(gid)) {
     return { balancesByUid: snapshot(), paid: true, alreadySettled: true };
   }
-  serverWalletSettledGameIds.add(st.gameId);
+  serverWalletSettledGameIds.add(gid);
   if (payload.draw) {
+    pushWalletLedger(st.whiteUid, {
+      type: "settlement",
+      source: "match_result",
+      reason: "draw",
+      prevBalance: getSrvBal(st.whiteUid),
+      nextBalance: getSrvBal(st.whiteUid),
+      delta: 0,
+      gameId: st.gameId,
+      note: "Paid match draw: no wallet movement",
+    });
+    pushWalletLedger(st.blackUid, {
+      type: "settlement",
+      source: "match_result",
+      reason: "draw",
+      prevBalance: getSrvBal(st.blackUid),
+      nextBalance: getSrvBal(st.blackUid),
+      delta: 0,
+      gameId: st.gameId,
+      note: "Paid match draw: no wallet movement",
+    });
     return { balancesByUid: snapshot(), paid: true };
   }
   const bet = st.betAmount;
   const { winnerAmount } = calculateWinnerCreditServer(bet);
-  let w = getSrvBal(st.whiteUid);
-  let b = getSrvBal(st.blackUid);
+  const prevW = getSrvBal(st.whiteUid);
+  const prevB = getSrvBal(st.blackUid);
+  let w = prevW;
+  let b = prevB;
   if (payload.winnerColor === "white") {
     w = Math.max(0, w - bet + winnerAmount);
     b = Math.max(0, b - bet);
@@ -87,9 +276,32 @@ function buildBalancesForGameResult(st, payload) {
   }
   serverBalancesByUid.set(st.whiteUid, w);
   serverBalancesByUid.set(st.blackUid, b);
+  pushWalletLedger(st.whiteUid, {
+    type: "settlement",
+    source: "match_result",
+    reason: payload.reason || "game_end",
+    prevBalance: prevW,
+    nextBalance: w,
+    delta: w - prevW,
+    gameId: st.gameId,
+    note: `Match settlement (${payload.winnerColor || "draw"})`,
+  });
+  pushWalletLedger(st.blackUid, {
+    type: "settlement",
+    source: "match_result",
+    reason: payload.reason || "game_end",
+    prevBalance: prevB,
+    nextBalance: b,
+    delta: b - prevB,
+    gameId: st.gameId,
+    note: `Match settlement (${payload.winnerColor || "draw"})`,
+  });
   return { balancesByUid: { [st.whiteUid]: w, [st.blackUid]: b }, paid: true };
 }
-/** Live clock payload from authoritative server state. */
+/**
+ * Live clock for clients — remaining ms after current turn's elapsed time.
+ * Internal `st.whiteMs` / `st.blackMs` stay as banks at turn start; never send raw banks without elapsed.
+ */
 function liveClockPayloadFromState(st) {
   const serverNow = Date.now();
   const elapsed = Math.max(0, serverNow - st.turnClockStartedAt);
@@ -114,53 +326,28 @@ function liveClockPayloadFromState(st) {
     serverNow,
   };
 }
-function emitPresenceState(st) {
-  if (!st || st.isFinished) return;
-  io.to(st.room).emit("presenceState", {
-    room: st.room,
-    gameId: st.gameId,
-    white: {
-      status: st.presence.white.status, // online|background|offline
-      deadlineMs: st.presence.white.deadlineMs,
-    },
-    black: {
-      status: st.presence.black.status,
-      deadlineMs: st.presence.black.deadlineMs,
-    },
-    serverNow: Date.now(),
-  });
-}
-function clearTimeoutSafe(id) {
-  if (id) clearTimeout(id);
-}
-function clearDisconnectGraceForColor(st, color) {
-  clearTimeoutSafe(st.disconnectTimeoutIdByColor[color]);
-  st.disconnectTimeoutIdByColor[color] = null;
-}
-function clearBackgroundGraceForColor(st, color) {
-  clearTimeoutSafe(st.backgroundTimeoutIdByColor[color]);
-  st.backgroundTimeoutIdByColor[color] = null;
-  st.presence[color].deadlineMs = null;
-}
-function clearAllTimers(st) {
-  clearDisconnectGraceForColor(st, "white");
-  clearDisconnectGraceForColor(st, "black");
-  clearBackgroundGraceForColor(st, "white");
-  clearBackgroundGraceForColor(st, "black");
+function clearDisconnectGrace(st) {
+  if (st.disconnectTimeoutId) {
+    clearTimeout(st.disconnectTimeoutId);
+    st.disconnectTimeoutId = null;
+  }
+  st.disconnectingColor = null;
 }
 function destroyRoomState(room) {
   const st = roomStates.get(room);
   if (!st) return;
-  clearAllTimers(st);
+  clearDisconnectGrace(st);
   roomStates.delete(room);
 }
 function endMatch(room, payload) {
   const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
+  if (!st || st.isFinished) {
+    return;
+  }
   st.isFinished = true;
-  clearAllTimers(st);
+  clearDisconnectGrace(st);
   const { balancesByUid, paid } = buildBalancesForGameResult(st, payload);
-  io.to(room).emit("gameResult", {
+  const out = {
     room,
     gameId: st.gameId,
     paid,
@@ -172,16 +359,22 @@ function endMatch(room, payload) {
     blackUid: st.blackUid,
     betAmount: st.betAmount,
     mode: st.mode,
-  });
+  };
   roomStates.delete(room);
+  io.to(room).emit("gameResult", out);
 }
+/** Side to move ran out of time — opponent wins (blitz flag). */
 function finalizeTimeoutFlag(room) {
   const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
+  if (!st || st.isFinished) {
+    return;
+  }
   const now = Date.now();
   const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
   const elapsed = Math.max(0, now - st.turnClockStartedAt);
-  if (bank - elapsed > 0) return;
+  if (bank - elapsed > 0) {
+    return;
+  }
   const winnerColor = st.toMove === "w" ? "black" : "white";
   endMatch(room, {
     reason: "timeout",
@@ -189,15 +382,20 @@ function finalizeTimeoutFlag(room) {
     draw: false,
   });
 }
+/** 1 Hz: broadcast live clocks + detect flag fall (server-only time). */
 function tickActiveGames() {
   for (const [room, st] of [...roomStates.entries()]) {
-    if (!st || st.isFinished || !roomStates.has(room)) continue;
+    if (!st || st.isFinished || !roomStates.has(room)) {
+      continue;
+    }
     const live = liveClockPayloadFromState(st);
-    if (st.toMove === "w" && live.whiteRemainingMs <= 0) {
+    const w = live.whiteRemainingMs;
+    const b = live.blackRemainingMs;
+    if (st.toMove === "w" && w <= 0) {
       finalizeTimeoutFlag(room);
       continue;
     }
-    if (st.toMove === "b" && live.blackRemainingMs <= 0) {
+    if (st.toMove === "b" && b <= 0) {
       finalizeTimeoutFlag(room);
       continue;
     }
@@ -205,9 +403,30 @@ function tickActiveGames() {
     io.to(room).emit("gameState", live);
   }
 }
+function startDisconnectGrace(room, disconnectedColor) {
+  const st = roomStates.get(room);
+  if (!st || st.isFinished) {
+    return;
+  }
+  clearDisconnectGrace(st);
+  st.disconnectingColor = disconnectedColor;
+  st.disconnectTimeoutId = setTimeout(() => {
+    st.disconnectTimeoutId = null;
+    if (!roomStates.has(room)) return;
+    const s2 = roomStates.get(room);
+    if (!s2 || s2.isFinished) return;
+    const winnerColor = disconnectedColor === "white" ? "black" : "white";
+    endMatch(room, {
+      reason: "disconnect_forfeit",
+      winnerColor,
+      draw: false,
+    });
+  }, 30_000);
+}
 function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
   destroyRoomState(room);
   const per = perPlayerMsForMode(mode);
+  const turnClockStartedAt = Date.now();
   const st = {
     room,
     gameId,
@@ -220,90 +439,49 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
     whiteMs: per,
     blackMs: per,
     toMove: "w",
-    turnClockStartedAt: Date.now(),
-    disconnectTimeoutIdByColor: {
-      white: null,
-      black: null,
-    },
-    backgroundTimeoutIdByColor: {
-      white: null,
-      black: null,
-    },
-    presence: {
-      white: { status: "online", deadlineMs: null },
-      black: { status: "online", deadlineMs: null },
-    },
+    turnClockStartedAt,
+    disconnectTimeoutId: null,
+    disconnectingColor: null,
   };
   roomStates.set(room, st);
   return st;
 }
-function startDisconnectGrace(room, color) {
-  const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
-  clearDisconnectGraceForColor(st, color);
-  st.presence[color].status = "offline";
-  emitPresenceState(st);
-  st.disconnectTimeoutIdByColor[color] = setTimeout(() => {
-    st.disconnectTimeoutIdByColor[color] = null;
-    const s2 = roomStates.get(room);
-    if (!s2 || s2.isFinished) return;
-    if (s2.presence[color].status !== "offline") return;
-    const winnerColor = color === "white" ? "black" : "white";
-    endMatch(room, {
-      reason: "disconnect_forfeit",
-      winnerColor,
-      draw: false,
-    });
-  }, DISCONNECT_FORFEIT_MS);
-}
-function startBackgroundGrace(room, color) {
-  const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
-  clearBackgroundGraceForColor(st, color);
-  st.presence[color].status = "background";
-  st.presence[color].deadlineMs = Date.now() + BACKGROUND_FORFEIT_MS;
-  emitPresenceState(st);
-  st.backgroundTimeoutIdByColor[color] = setTimeout(() => {
-    st.backgroundTimeoutIdByColor[color] = null;
-    const s2 = roomStates.get(room);
-    if (!s2 || s2.isFinished) return;
-    if (s2.presence[color].status !== "background") return;
-    const winnerColor = color === "white" ? "black" : "white";
-    endMatch(room, {
-      reason: "background_forfeit",
-      winnerColor,
-      draw: false,
-    });
-  }, BACKGROUND_FORFEIT_MS);
-}
-function stopBackgroundGrace(room, color) {
-  const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
-  clearBackgroundGraceForColor(st, color);
-  st.presence[color].status = "online";
-  emitPresenceState(st);
-}
-function markOnlineAndClearAllGrace(room, color) {
-  const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
-  clearDisconnectGraceForColor(st, color);
-  clearBackgroundGraceForColor(st, color);
-  st.presence[color].status = "online";
-  emitPresenceState(st);
+function queueKey(mode, betAmount) {
+  if (mode === "paid") {
+    return `paid_${Number(betAmount) || 0}`;
+  }
+  return "free";
 }
 function moverCharFromMeta(meta) {
-  if (!meta || (meta.color !== "white" && meta.color !== "black")) return null;
+  if (!meta || (meta.color !== "white" && meta.color !== "black")) {
+    return null;
+  }
   return meta.color === "white" ? "w" : "b";
 }
 function handlePlayerResigned(socket, payload = {}) {
   const room = socket.matchMeta?.room;
-  if (!room || socket.room !== room || !socket.matchMeta) return;
+  if (!room || socket.room !== room || !socket.matchMeta) {
+    return;
+  }
+  if (socket.matchMeta.room !== room) {
+    return;
+  }
   const st = roomStates.get(room);
-  if (!st || st.isFinished) return;
+  if (!st || st.isFinished) {
+    return;
+  }
   const reqGid = payload.gameId != null ? String(payload.gameId) : "";
   const reqPid = payload.playerId != null ? String(payload.playerId) : "";
-  if (reqGid && reqGid !== st.gameId) return;
-  if (reqPid && socket.matchMeta.playerId && reqPid !== socket.matchMeta.playerId) return;
+  if (reqGid && reqGid !== st.gameId) {
+    return;
+  }
+  if (
+    reqPid &&
+    socket.matchMeta.playerId &&
+    reqPid !== socket.matchMeta.playerId
+  ) {
+    return;
+  }
   const loserColor = socket.matchMeta.color;
   const winnerColor = loserColor === "white" ? "black" : "white";
   endMatch(room, {
@@ -313,8 +491,8 @@ function handlePlayerResigned(socket, payload = {}) {
   });
 }
 io.on("connection", (socket) => {
+  console.log("Player connected:", socket.id);
   socket.on("joinGame", (payload = {}) => {
-    // Firestore room flow
     if (payload.firestoreMatchId) {
       const rid = String(payload.firestoreMatchId)
         .replace(/[^a-zA-Z0-9_-]/g, "")
@@ -324,12 +502,12 @@ io.on("connection", (socket) => {
         return;
       }
       const mode = payload.mode === "paid" ? "paid" : "free";
-      const betAmount = mode === "paid"
-        ? Math.max(0, Math.floor(Number(payload.betAmount) || 0))
-        : 0;
-      const uid = typeof payload.uid === "string" && payload.uid.length > 0
-        ? payload.uid
-        : socket.id;
+      const betAmount =
+        mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
+      const uid =
+        typeof payload.uid === "string" && payload.uid.length > 0
+          ? payload.uid
+          : socket.id;
       if (mode === "paid" && betAmount <= 0) {
         socket.emit("matchmaking_error", {
           message: "Invalid stake for a money match.",
@@ -377,7 +555,8 @@ io.on("connection", (socket) => {
         mode,
         playerId: blackUid,
       };
-      const st = createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
+      createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
+      const st = roomStates.get(room);
       const startPayload = (color) => ({
         room,
         color,
@@ -390,17 +569,15 @@ io.on("connection", (socket) => {
       });
       first.socket.emit("start", startPayload("white"));
       socket.emit("start", startPayload("black"));
-      emitPresenceState(st);
       return;
     }
-    // Normal queue flow
     const mode = payload.mode === "paid" ? "paid" : "free";
-    const betAmount = mode === "paid"
-      ? Math.max(0, Math.floor(Number(payload.betAmount) || 0))
-      : 0;
-    const uid = typeof payload.uid === "string" && payload.uid.length > 0
-      ? payload.uid
-      : socket.id;
+    const betAmount =
+      mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
+    const uid =
+      typeof payload.uid === "string" && payload.uid.length > 0
+        ? payload.uid
+        : socket.id;
     if (mode === "paid" && betAmount <= 0) {
       socket.emit("matchmaking_error", {
         message: "Invalid stake for a money match.",
@@ -409,14 +586,19 @@ io.on("connection", (socket) => {
     }
     const guestLike =
       typeof payload.uid === "string" && payload.uid.startsWith("guest_");
-    if (mode === "paid" && (!payload.uid || (payload.uid === socket.id && !guestLike))) {
+    if (
+      mode === "paid" &&
+      (!payload.uid || (payload.uid === socket.id && !guestLike))
+    ) {
       socket.emit("matchmaking_error", {
         message: "Use a guest id for paid test matches.",
       });
       return;
     }
     const key = queueKey(mode, betAmount);
-    if (!waitingQueues.has(key)) waitingQueues.set(key, []);
+    if (!waitingQueues.has(key)) {
+      waitingQueues.set(key, []);
+    }
     const queue = waitingQueues.get(key);
     const entry = { socket, uid, mode, betAmount };
     if (queue.length > 0) {
@@ -445,7 +627,8 @@ io.on("connection", (socket) => {
         mode,
         playerId: blackUid,
       };
-      const st = createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
+      createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
+      const st = roomStates.get(room);
       const startPayload = (color) => ({
         room,
         color,
@@ -458,7 +641,6 @@ io.on("connection", (socket) => {
       });
       waitingPlayer.socket.emit("start", startPayload("white"));
       socket.emit("start", startPayload("black"));
-      emitPresenceState(st);
     } else {
       queue.push(entry);
       socket.waitingQueueKey = key;
@@ -467,7 +649,10 @@ io.on("connection", (socket) => {
   });
   socket.on("rejoinMatch", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
-    const uid = typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : "";
+    const uid =
+      typeof payload.uid === "string" && payload.uid.length > 0
+        ? payload.uid
+        : "";
     if (!room || !uid) {
       socket.emit("rejoinFailed", { message: "Invalid rejoin payload." });
       return;
@@ -492,7 +677,7 @@ io.on("connection", (socket) => {
       mode: st.mode,
       playerId: uid,
     };
-    markOnlineAndClearAllGrace(room, color);
+    clearDisconnectGrace(st);
     socket.emit("rejoinOk", {
       room,
       color,
@@ -505,39 +690,26 @@ io.on("connection", (socket) => {
       blackUid: st.blackUid,
       clock: liveClockPayloadFromState(st),
     });
-    const live = liveClockPayloadFromState(st);
-    io.to(room).emit("clockSync", live);
-    io.to(room).emit("gameState", live);
-    emitPresenceState(st);
-  });
-  socket.on("playerBackground", (payload = {}) => {
-    const room = socket.matchMeta?.room;
-    const color = socket.matchMeta?.color;
-    if (!room || !color || socket.room !== room) return;
-    const st = roomStates.get(room);
-    if (!st || st.isFinished) return;
-    const reqGid = payload.gameId != null ? String(payload.gameId) : "";
-    if (reqGid && reqGid !== st.gameId) return;
-    startBackgroundGrace(room, color);
-  });
-  socket.on("playerForeground", (payload = {}) => {
-    const room = socket.matchMeta?.room;
-    const color = socket.matchMeta?.color;
-    if (!room || !color || socket.room !== room) return;
-    const st = roomStates.get(room);
-    if (!st || st.isFinished) return;
-    const reqGid = payload.gameId != null ? String(payload.gameId) : "";
-    if (reqGid && reqGid !== st.gameId) return;
-    stopBackgroundGrace(room, color);
+    const liveRejoin = liveClockPayloadFromState(st);
+    io.to(room).emit("clockSync", liveRejoin);
+    io.to(room).emit("gameState", liveRejoin);
   });
   socket.on("move", (data = {}) => {
-    if (!data?.move) return;
+    if (!data?.move) {
+      return;
+    }
     const room = typeof data.room === "string" ? data.room : "";
-    if (!room || socket.room !== room || !socket.matchMeta) return;
+    if (!room || socket.room !== room || !socket.matchMeta) {
+      return;
+    }
     const st = roomStates.get(room);
-    if (!st || st.isFinished) return;
+    if (!st || st.isFinished) {
+      return;
+    }
     const mover = moverCharFromMeta(socket.matchMeta);
-    if (!mover || mover !== st.toMove) return;
+    if (!mover || mover !== st.toMove) {
+      return;
+    }
     const now = Date.now();
     const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
     const elapsed = Math.max(0, now - st.turnClockStartedAt);
@@ -550,9 +722,14 @@ io.on("connection", (socket) => {
       to: data.move.to,
       promotion: data.move.promotion || "q",
     });
-    if (!moveTry) return;
-    if (st.toMove === "w") st.whiteMs = bank - elapsed;
-    else st.blackMs = bank - elapsed;
+    if (!moveTry) {
+      return;
+    }
+    if (st.toMove === "w") {
+      st.whiteMs = bank - elapsed;
+    } else {
+      st.blackMs = bank - elapsed;
+    }
     st.toMove = st.toMove === "w" ? "b" : "w";
     st.turnClockStartedAt = now;
     io.to(room).emit("move", data.move);
@@ -577,24 +754,31 @@ io.on("connection", (socket) => {
       });
     }
   });
-  socket.on("playerResigned", (payload) => handlePlayerResigned(socket, payload));
+  socket.on("playerResigned", (payload) =>
+    handlePlayerResigned(socket, payload)
+  );
   socket.on("resign", (payload) => handlePlayerResigned(socket, payload));
   socket.on("disconnect", () => {
+    console.log("Player disconnected");
     const fsKey = socket.firestoreMatchWaiterKey;
     if (fsKey && firestoreMatchWaiters.get(fsKey)?.socket === socket) {
       firestoreMatchWaiters.delete(fsKey);
     }
     const meta = socket.matchMeta;
-    if (meta?.room && meta?.color) {
+    if (meta?.room && meta.color) {
       const st = roomStates.get(meta.room);
       if (st && !st.isFinished) {
         startDisconnectGrace(meta.room, meta.color);
       }
     }
     const key = socket.waitingQueueKey;
-    if (!key) return;
+    if (!key) {
+      return;
+    }
     const queue = waitingQueues.get(key);
-    if (!queue) return;
+    if (!queue) {
+      return;
+    }
     const idx = queue.findIndex((e) => e.socket === socket);
     if (idx >= 0) {
       queue.splice(idx, 1);
